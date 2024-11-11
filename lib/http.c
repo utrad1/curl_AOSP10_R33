@@ -717,6 +717,21 @@ output_auth_headers(struct connectdata *conn,
   return CURLE_OK;
 }
 
+/*
+ * Curl_allow_auth_to_host() tells if authentication, cookies or other
+ * "sensitive data" can (still) be sent tohis host.
+ */
+bool Curl_allow_auth_to_host(struct Curl_easy *data)
+{
+  struct connectdata *conn = data->conn;
+  return (!data->state.this_is_a_follow ||
+          data->set.allow_auth_to_other_hosts ||
+          (data->state.first_host &&
+           strcasecompare(data->state.first_host, conn->host.name) &&
+           (data->state.first_remote_port == conn->remote_port) &&
+           (data->state.first_remote_protocol == conn->handler->protocol)));
+}
+
 /**
  * Curl_http_output_auth() setups the authentication headers for the
  * host/proxy and the correct authentication
@@ -785,15 +800,12 @@ Curl_http_output_auth(struct connectdata *conn,
        with it */
     authproxy->done = TRUE;
 
-  /* To prevent the user+password to get sent to other than the original
-     host due to a location-follow, we do some weirdo checks here */
-  if(!data->state.this_is_a_follow ||
-     conn->bits.netrc ||
-     !data->state.first_host ||
-     data->set.allow_auth_to_other_hosts ||
-     strcasecompare(data->state.first_host, conn->host.name)) {
+  /* To prevent the user+password to get sent to other than the original host
+     due to a location-follow */
+  if(Curl_allow_auth_to_host(data)
+     || conn->bits.netrc
+    )
     result = output_auth_headers(conn, authhost, request, path, FALSE);
-  }
   else
     authhost->done = TRUE;
 
@@ -1842,10 +1854,7 @@ CURLcode Curl_add_custom_headers(struct connectdata *conn,
                    checkprefix("Cookie:", compare)) &&
                   /* be careful of sending this potentially sensitive header to
                      other hosts */
-                  (data->state.this_is_a_follow &&
-                   data->state.first_host &&
-                   !data->set.allow_auth_to_other_hosts &&
-                   !strcasecompare(data->state.first_host, conn->host.name)))
+                  !Curl_allow_auth_to_host(data))
             ;
           else {
             result = Curl_add_bufferf(&req_buffer, "%s\r\n", compare);
@@ -2001,7 +2010,7 @@ CURLcode Curl_http(struct connectdata *conn, bool *done)
     if(!data->state.first_host)
       return CURLE_OUT_OF_MEMORY;
 
-    data->state.first_remote_port = conn->remote_port;
+    data->state.first_remote_protocol = conn->handler->protocol;
   }
 
   if((conn->handler->protocol&(PROTO_FAMILY_HTTP|CURLPROTO_FTP)) &&

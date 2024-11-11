@@ -1513,6 +1513,7 @@ CURLcode Curl_pretransfer(struct Curl_easy *data)
   data->state.wildcardmatch = data->set.wildcard_enabled;
   data->set.followlocation = 0; /* reset the location-follow counter */
   data->state.this_is_a_follow = FALSE; /* reset this */
+  data->state.this_is_a_follow_without_auth = FALSE;
   data->state.errorbuf = FALSE; /* no error has occurred */
   data->state.httpversion = 0; /* don't assume any particular server version */
 
@@ -1631,6 +1632,9 @@ CURLcode Curl_follow(struct Curl_easy *data,
       data->set.followlocation++; /* count location-followers */
 
       if(data->set.http_auto_referer) {
+        CURLU *u;
+        char *referer;
+
         /* We are asked to automatically set the previous URL as the referer
            when we get the next URL. We pick the ->url field, which may or may
            not be 100% correct */
@@ -1640,9 +1644,26 @@ CURLcode Curl_follow(struct Curl_easy *data,
           data->change.referer_alloc = FALSE;
         }
 
-        data->change.referer = strdup(data->change.url);
-        if(!data->change.referer)
+        /* Make a copy of the URL without crenditals and fragment */
+        u = curl_url();
+        if(!u)
           return CURLE_OUT_OF_MEMORY;
+
+        uc = curl_url_set(u, CURLUPART_URL, data->change.url, 0);
+        if(!uc)
+          uc = curl_url_set(u, CURLUPART_FRAGMENT, NULL, 0);
+        if(!uc)
+          uc = curl_url_set(u, CURLUPART_USER, NULL, 0);
+        if(!uc)
+          uc = curl_url_set(u, CURLUPART_PASSWORD, NULL, 0);
+        if(!uc)
+          uc = curl_url_get(u, CURLUPART_URL, &referer, 0);
+
+        curl_url_cleanup(u);
+
+        if(uc || referer == NULL)
+          return CURLE_OUT_OF_MEMORY;
+        data->change.referer = referer;
         data->change.referer_alloc = TRUE; /* yes, free this later */
       }
     }
@@ -1666,10 +1687,55 @@ CURLcode Curl_follow(struct Curl_easy *data,
       return CURLE_OUT_OF_MEMORY;
   }
   else {
-
     uc = curl_url_get(data->state.uh, CURLUPART_URL, &newurl, 0);
     if(uc)
       return Curl_uc_to_curlcode(uc);
+
+    /* Clear auth if this redirects to a different port number or protocol,
+       unless permitted */
+    if(!data->set.allow_auth_to_other_hosts && (type != FOLLOW_FAKE)) {
+      char *portnum;
+      int port;
+      bool clear = FALSE;
+
+      if(data->set.use_port && data->state.allow_port)
+        /* a custom port is used */
+        port = (int)data->set.use_port;
+      else {
+        uc = curl_url_get(data->state.uh, CURLUPART_PORT, &portnum,
+                          CURLU_DEFAULT_PORT);
+        if(uc) {
+          free(newurl);
+          return Curl_uc_to_curlcode(uc);
+        }
+        port = atoi(portnum);
+        free(portnum);
+      }
+      if(port != data->info.conn_remote_port) {
+        infof(data, "Clear auth, redirects to port from %u to %u",
+              data->info.conn_remote_port, port);
+        clear = TRUE;
+      }
+      else {
+        char *scheme;
+        const struct Curl_handler *p;
+        uc = curl_url_get(data->state.uh, CURLUPART_SCHEME, &scheme, 0);
+        if(uc) {
+          free(newurl);
+          return Curl_uc_to_curlcode(uc);
+        }
+
+        p = Curl_builtin_scheme(scheme);
+        if(p && (p->protocol != data->info.conn_protocol)) {
+          infof(data, "Clear auth, redirects scheme from %s to %s",
+                data->info.conn_scheme, scheme);
+          clear = TRUE;
+        }
+        free(scheme);
+      }
+      if(clear)
+        data->state.this_is_a_follow_without_auth = TRUE;
+    }
   }
 
   if(type == FOLLOW_FAKE) {
